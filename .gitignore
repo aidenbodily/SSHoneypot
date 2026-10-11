@@ -1,4 +1,7 @@
 attacks.db
+attacks.db-wal
+attacks.db-shm
 __pycache__/
 *.pyc
 .venv/
+.DS_Store
