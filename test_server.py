@@ -10,6 +10,8 @@ import tempfile
 import threading
 import time
 import unittest
+from contextlib import closing
+from datetime import datetime
 from pathlib import Path
 from unittest import mock
 
@@ -103,7 +105,9 @@ class ServerIntegrationTests(unittest.TestCase):
         deadline = time.monotonic() + 2
         while time.monotonic() < deadline:
             try:
-                with sqlite3.connect(self.database, timeout=0.2) as connection:
+                with closing(
+                    sqlite3.connect(self.database, timeout=0.2)
+                ) as connection:
                     count = connection.execute(
                         "SELECT COUNT(*) FROM events WHERE event_type = 'CONNECT'"
                     ).fetchone()[0]
@@ -113,6 +117,44 @@ class ServerIntegrationTests(unittest.TestCase):
                 return
             time.sleep(0.01)
         self.fail(f"server did not log {minimum} CONNECT events")
+
+    def wait_for_finished_session(self, session_id):
+        """Return completed metadata after the worker has finalized its session."""
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline:
+            with closing(sqlite3.connect(self.database)) as connection:
+                connection.row_factory = sqlite3.Row
+                session = connection.execute(
+                    """
+                    SELECT * FROM sessions
+                    WHERE session_id = ? AND ended_at IS NOT NULL
+                    """,
+                    (session_id,),
+                ).fetchone()
+            if session is not None:
+                return session
+            time.sleep(0.01)
+        self.fail(f"session {session_id} was not finalized")
+
+    def wait_for_disconnect_reason(self, reason):
+        """Return the latest completed session with the requested reason."""
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline:
+            with closing(sqlite3.connect(self.database)) as connection:
+                connection.row_factory = sqlite3.Row
+                session = connection.execute(
+                    """
+                    SELECT * FROM sessions
+                    WHERE disconnect_reason = ? AND ended_at IS NOT NULL
+                    ORDER BY started_at DESC
+                    LIMIT 1
+                    """,
+                    (reason,),
+                ).fetchone()
+            if session is not None:
+                return session
+            time.sleep(0.01)
+        self.fail(f"no completed session recorded reason {reason}")
 
     def exchange(self, requests):
         """Send protocol requests and decode the server's JSON-line responses."""
@@ -133,19 +175,69 @@ class ServerIntegrationTests(unittest.TestCase):
         self.assertTrue(first[1].startswith("root\n"))
         self.assertTrue(second[1].startswith("/root\n"))
 
-        with sqlite3.connect(self.database) as connection:
+        with closing(sqlite3.connect(self.database)) as connection:
             event_types = {
                 row[0] for row in connection.execute("SELECT event_type FROM events")
             }
             stored_passwords = connection.execute(
                 "SELECT password FROM events WHERE event_type = 'LOGIN_FAKE'"
             ).fetchall()
+            root_session_id = connection.execute(
+                """
+                SELECT session_id FROM events
+                WHERE event_type = 'LOGIN_FAKE' AND username = 'root'
+                """
+            ).fetchone()[0]
+            admin_session_id = connection.execute(
+                """
+                SELECT session_id FROM events
+                WHERE event_type = 'LOGIN_FAKE' AND username = 'admin'
+                """
+            ).fetchone()[0]
         self.assertTrue({"CONNECT", "LOGIN_FAKE", "CMD", "DISCONNECT"} <= event_types)
         self.assertTrue(all(password is None for (password,) in stored_passwords))
+        self.assertNotEqual(root_session_id, admin_session_id)
+
+        root_session = self.wait_for_finished_session(root_session_id)
+        self.assertEqual(root_session["request_count"], 3)
+        self.assertEqual(root_session["login_attempts"], 1)
+        self.assertEqual(root_session["command_count"], 1)
+        self.assertEqual(root_session["disconnect_reason"], "logout")
+        self.assertGreaterEqual(root_session["duration_seconds"], 0)
+
+        wall_duration = (
+            datetime.fromisoformat(root_session["ended_at"])
+            - datetime.fromisoformat(root_session["started_at"])
+        ).total_seconds()
+        self.assertAlmostEqual(
+            root_session["duration_seconds"], wall_duration, delta=0.1
+        )
+
+        with closing(sqlite3.connect(self.database)) as connection:
+            session_ids = {
+                row[0]
+                for row in connection.execute(
+                    "SELECT session_id FROM events WHERE session_id = ?",
+                    (root_session_id,),
+                )
+            }
+            root_event_types = {
+                row[0]
+                for row in connection.execute(
+                    "SELECT event_type FROM events WHERE session_id = ?",
+                    (root_session_id,),
+                )
+            }
+        self.assertEqual(session_ids, {root_session_id})
+        self.assertEqual(
+            root_event_types, {"CONNECT", "LOGIN_FAKE", "CMD", "DISCONNECT"}
+        )
 
     def test_malformed_oversized_and_ssh_clients_are_bounded(self):
         malformed = self.exchange(["NOT_A_REQUEST"])
         self.assertIn("Invalid request", malformed[0])
+        failed_login = self.exchange(["LOGIN missing-password"])
+        self.assertIn("Invalid request", failed_login[0])
 
         with socket.create_connection(("127.0.0.1", self.port), timeout=1) as client:
             client.sendall(b"CMD " + b"x" * 200 + b"\n")
@@ -155,15 +247,54 @@ class ServerIntegrationTests(unittest.TestCase):
                 # A reset is also an acceptable rejection of an oversized request.
                 pass
 
+        oversized_session = self.wait_for_disconnect_reason("invalid_request")
+        self.assertEqual(oversized_session["request_count"], 0)
+
         with socket.create_connection(("127.0.0.1", self.port), timeout=1) as client:
             client.sendall(b"SSH-2.0-OpenSSH_9.0\r\n")
             response = client.makefile("r", encoding="utf-8").readline()
             self.assertIn("not supported", json.loads(response))
 
+        ssh_session = self.wait_for_disconnect_reason("ssh_probe")
+        with closing(sqlite3.connect(self.database)) as connection:
+            event_types = {
+                row[0]
+                for row in connection.execute(
+                    "SELECT event_type FROM events WHERE session_id = ?",
+                    (ssh_session["session_id"],),
+                )
+            }
+            invalid_count = connection.execute(
+                "SELECT COUNT(*) FROM events WHERE event_type = 'INVALID_REQUEST'"
+            ).fetchone()[0]
+            login_fail_count = connection.execute(
+                "SELECT COUNT(*) FROM events WHERE event_type = 'LOGIN_FAIL'"
+            ).fetchone()[0]
+        self.assertEqual(ssh_session["request_count"], 1)
+        self.assertIn("SSH_PROBE", event_types)
+        self.assertIn("DISCONNECT", event_types)
+        self.assertGreaterEqual(invalid_count, 2)
+        self.assertGreaterEqual(login_fail_count, 1)
+
     def test_idle_client_times_out(self):
         with socket.create_connection(("127.0.0.1", self.port), timeout=1) as client:
             client.settimeout(1)
             self.assertEqual(client.recv(1), b"")
+
+        session = self.wait_for_disconnect_reason("idle_timeout")
+        self.assertEqual(session["request_count"], 0)
+        self.assertEqual(session["login_attempts"], 0)
+        self.assertEqual(session["command_count"], 0)
+        self.assertGreaterEqual(session["duration_seconds"], 0.3)
+        with closing(sqlite3.connect(self.database)) as connection:
+            event_types = {
+                row[0]
+                for row in connection.execute(
+                    "SELECT event_type FROM events WHERE session_id = ?",
+                    (session["session_id"],),
+                )
+            }
+        self.assertEqual(event_types, {"CONNECT", "TIMEOUT", "DISCONNECT"})
 
     def test_concurrent_clients(self):
         failures = []
@@ -203,8 +334,115 @@ class ServerIntegrationTests(unittest.TestCase):
         self.assertEqual(client.recv(1), b"")
         client.close()
 
+        session = self.wait_for_disconnect_reason("server_shutdown")
+        self.assertEqual(session["request_count"], 0)
+        with closing(sqlite3.connect(self.database)) as connection:
+            event_types = {
+                row[0]
+                for row in connection.execute(
+                    "SELECT event_type FROM events WHERE session_id = ?",
+                    (session["session_id"],),
+                )
+            }
+        self.assertEqual(event_types, {"CONNECT", "DISCONNECT"})
+
 
 class StartupFailureTests(unittest.TestCase):
+    def test_legacy_database_migration_preserves_events(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            database = Path(temporary_directory) / "legacy.db"
+            with closing(sqlite3.connect(database)) as connection:
+                connection.execute(
+                    """
+                    CREATE TABLE events (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        timestamp TEXT NOT NULL,
+                        source_ip TEXT NOT NULL,
+                        username TEXT,
+                        password TEXT,
+                        command TEXT,
+                        event_type TEXT NOT NULL
+                    )
+                    """
+                )
+                connection.execute(
+                    """
+                    INSERT INTO events
+                        (timestamp, source_ip, username, password, command,
+                         event_type)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        "2026-10-01T00:00:00+00:00",
+                        "192.0.2.10",
+                        "legacy-user",
+                        None,
+                        "whoami",
+                        "CMD",
+                    ),
+                )
+                connection.commit()
+
+            port = unused_port()
+            process = subprocess.Popen(
+                [
+                    sys.executable,
+                    "-u",
+                    str(SERVER),
+                    "--host",
+                    "127.0.0.1",
+                    "--port",
+                    str(port),
+                    "--database",
+                    str(database),
+                    "--retention-days",
+                    "1",
+                    "--idle-timeout",
+                    "0.3",
+                    "--shutdown-grace-seconds",
+                    "2",
+                ],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+            )
+            deadline = time.monotonic() + 4
+            while time.monotonic() < deadline:
+                if process.poll() is not None:
+                    self.fail(f"migration server failed:\n{process.communicate()[0]}")
+                try:
+                    with socket.create_connection(
+                        ("127.0.0.1", port), timeout=0.1
+                    ):
+                        break
+                except OSError:
+                    time.sleep(0.03)
+            else:
+                process.kill()
+                self.fail("migration server did not begin listening")
+
+            process.send_signal(signal.SIGTERM)
+            output, _ = process.communicate(timeout=4)
+            self.assertEqual(process.returncode, 0, output)
+
+            with closing(sqlite3.connect(database)) as connection:
+                event_columns = {
+                    row[1] for row in connection.execute("PRAGMA table_info(events)")
+                }
+                legacy_row = connection.execute(
+                    """
+                    SELECT username, command, event_type, session_id
+                    FROM events WHERE username = 'legacy-user'
+                    """
+                ).fetchone()
+                new_session_count = connection.execute(
+                    "SELECT COUNT(*) FROM sessions"
+                ).fetchone()[0]
+
+        self.assertIn("session_id", event_columns)
+        self.assertEqual(legacy_row, ("legacy-user", "whoami", "CMD", None))
+        self.assertGreaterEqual(new_session_count, 1)
+
     def test_database_size_limit_stops_startup(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
             database = Path(temporary_directory) / "attacks.db"

@@ -9,6 +9,7 @@ import sqlite3
 import sys
 import threading
 import time
+import uuid
 from contextlib import closing
 from datetime import datetime, timezone
 from pathlib import Path
@@ -142,7 +143,7 @@ def run_database_write(operation, description):
 
 
 def initialize_database():
-    """Create the schema and remove expired rows before accepting clients."""
+    """Create or migrate the schema before accepting client connections."""
     try:
         DATABASE.parent.mkdir(parents=True, exist_ok=True)
     except OSError as error:
@@ -162,9 +163,40 @@ def initialize_database():
                 username TEXT,
                 password TEXT,
                 command TEXT,
-                event_type TEXT NOT NULL
+                event_type TEXT NOT NULL,
+                session_id TEXT
             )
             """
+        )
+        event_columns = {
+            row[1] for row in connection.execute("PRAGMA table_info(events)")
+        }
+        if "session_id" not in event_columns:
+            # SQLite preserves every legacy row while adding NULL for this field.
+            connection.execute("ALTER TABLE events ADD COLUMN session_id TEXT")
+
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS sessions (
+                session_id TEXT PRIMARY KEY,
+                source_ip TEXT NOT NULL,
+                started_at TEXT NOT NULL,
+                ended_at TEXT,
+                duration_seconds REAL,
+                request_count INTEGER NOT NULL DEFAULT 0,
+                login_attempts INTEGER NOT NULL DEFAULT 0,
+                command_count INTEGER NOT NULL DEFAULT 0,
+                disconnect_reason TEXT
+            )
+            """
+        )
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_events_session_id "
+            "ON events(session_id)"
+        )
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_sessions_started_at "
+            "ON sessions(started_at)"
         )
         # Retention cleanup runs at startup, before new sessions are accepted.
         if RETENTION_DAYS > 0:
@@ -174,33 +206,133 @@ def initialize_database():
                 timezone.utc,
             ).isoformat()
             connection.execute(
-                "DELETE FROM events WHERE timestamp < ?", (cutoff_timestamp,)
+                """
+                DELETE FROM events
+                WHERE session_id IS NOT NULL AND timestamp < ?
+                """,
+                (cutoff_timestamp,),
+            )
+            connection.execute(
+                "DELETE FROM sessions WHERE ended_at IS NOT NULL AND ended_at < ?",
+                (cutoff_timestamp,),
             )
 
     return run_database_write(create_schema, "initialization")
 
 
-def log_event(source_ip, event_type, username=None, password=None, command=None):
-    """Sanitize and store one event, redacting passwords by default."""
-    def insert_event(connection):
-        # Use placeholders so input values are not treated as SQL code.
+def insert_event(
+    connection,
+    session_id,
+    source_ip,
+    event_type,
+    username=None,
+    password=None,
+    command=None,
+    timestamp=None,
+):
+    """Insert one already-associated event inside an existing transaction."""
+    connection.execute(
+        """
+        INSERT INTO events
+            (timestamp, source_ip, username, password, command, event_type,
+             session_id)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            timestamp or datetime.now(timezone.utc).isoformat(),
+            clean_for_log(source_ip),
+            clean_for_log(username),
+            clean_for_log(password) if STORE_PASSWORDS else None,
+            clean_for_log(command),
+            event_type,
+            session_id,
+        ),
+    )
+
+
+def start_session(session_id, source_ip, started_at):
+    """Create session metadata and its CONNECT event atomically."""
+    def insert_session(connection):
         connection.execute(
             """
-            INSERT INTO events
-                (timestamp, source_ip, username, password, command, event_type)
-            VALUES (?, ?, ?, ?, ?, ?)
+            INSERT INTO sessions (session_id, source_ip, started_at)
+            VALUES (?, ?, ?)
             """,
-            (
-                datetime.now(timezone.utc).isoformat(),
-                clean_for_log(source_ip),
-                clean_for_log(username),
-                clean_for_log(password) if STORE_PASSWORDS else None,
-                clean_for_log(command),
-                event_type,
-            ),
+            (session_id, clean_for_log(source_ip), started_at),
+        )
+        insert_event(
+            connection,
+            session_id,
+            source_ip,
+            "CONNECT",
+            timestamp=started_at,
         )
 
-    return run_database_write(insert_event, f"write for {event_type}")
+    return run_database_write(insert_session, "session start")
+
+
+def log_event(
+    session_id,
+    source_ip,
+    event_type,
+    username=None,
+    password=None,
+    command=None,
+):
+    """Sanitize and store one event, redacting passwords by default."""
+    def write_event(connection):
+        # insert_event uses placeholders so values cannot become SQL code.
+        insert_event(
+            connection,
+            session_id,
+            source_ip,
+            event_type,
+            username=username,
+            password=password,
+            command=command,
+        )
+
+    return run_database_write(write_event, f"write for {event_type}")
+
+
+def finish_session(
+    session_id,
+    source_ip,
+    ended_at,
+    duration_seconds,
+    request_count,
+    login_attempts,
+    command_count,
+    disconnect_reason,
+):
+    """Finalize session counters and add DISCONNECT in one transaction."""
+    def update_session(connection):
+        connection.execute(
+            """
+            UPDATE sessions
+            SET ended_at = ?, duration_seconds = ?, request_count = ?,
+                login_attempts = ?, command_count = ?, disconnect_reason = ?
+            WHERE session_id = ?
+            """,
+            (
+                ended_at,
+                duration_seconds,
+                request_count,
+                login_attempts,
+                command_count,
+                disconnect_reason,
+                session_id,
+            ),
+        )
+        insert_event(
+            connection,
+            session_id,
+            source_ip,
+            "DISCONNECT",
+            timestamp=ended_at,
+        )
+
+    return run_database_write(update_session, "session finish")
 
 
 def fake_command_output(command):
@@ -307,21 +439,28 @@ def read_request(client_socket, pending_bytes):
     return raw_line.rstrip(b"\r").decode("utf-8", errors="replace"), bytearray(remaining)
 
 
-def handle_client(client_socket, client_address):
+def handle_client(client_socket, client_address, session_id):
     """Serve one isolated fake-shell session and record its activity."""
     print(f"Connected by {client_address}")
     source_ip = client_address[0]
     logged_in = False  # Each client starts with its own simulated login state.
+    started_at = datetime.now(timezone.utc).isoformat()
+    session_started = time.monotonic()
+    request_count = 0
+    login_attempts = 0
+    command_count = 0
+    disconnect_reason = "client_closed"
+    session_recorded = False
 
     try:
         with client_socket:
             # Stop serving if an event cannot be stored; silent data loss is unsafe.
-            if not log_event(source_ip, "CONNECT"):
+            if not start_session(session_id, source_ip, started_at):
+                disconnect_reason = "database_failure"
                 return
+            session_recorded = True
             client_socket.settimeout(IDLE_TIMEOUT_SECONDS)
             pending_bytes = bytearray()
-            session_started = time.monotonic()
-            request_count = 0
 
             while (
                 request_count < MAX_REQUESTS_PER_SESSION
@@ -331,6 +470,9 @@ def handle_client(client_socket, client_address):
                 elapsed = time.monotonic() - session_started
                 remaining_session = MAX_SESSION_SECONDS - elapsed
                 if remaining_session <= 0:
+                    disconnect_reason = "session_timeout"
+                    if not log_event(session_id, source_ip, "TIMEOUT"):
+                        disconnect_reason = "database_failure"
                     print(f"Session time limit reached: {client_address}")
                     break
                 client_socket.settimeout(
@@ -339,6 +481,8 @@ def handle_client(client_socket, client_address):
 
                 line, pending_bytes = read_request(client_socket, pending_bytes)
                 if line is None:
+                    if shutdown_event.is_set():
+                        disconnect_reason = "server_shutdown"
                     break
                 request_count += 1
 
@@ -348,17 +492,28 @@ def handle_client(client_socket, client_address):
 
                 # Close real SSH attempts: this exercise uses a text protocol.
                 if line.startswith("SSH-"):
+                    disconnect_reason = "ssh_probe"
+                    if not log_event(
+                        session_id,
+                        source_ip,
+                        "SSH_PROBE",
+                        command=line,
+                    ):
+                        disconnect_reason = "database_failure"
+                        break
                     client_socket.sendall(
                         (json.dumps("SSH protocol is not supported.") + "\n").encode()
                     )
                     break
 
                 if request == "LOGIN":
+                    login_attempts += 1
                     username = parts[1] if len(parts) > 1 else None
                     password = parts[2] if len(parts) > 2 else None
                     valid_login = bool(username and password)
                     logged_in = logged_in or valid_login
                     if not log_event(
+                        session_id,
                         source_ip,
                         "LOGIN_FAKE" if valid_login else "LOGIN_FAIL",
                         username=username,
@@ -366,9 +521,23 @@ def handle_client(client_socket, client_address):
                     ):
                         break
 
-                if request == "CMD":
-                    command = line[4:] if len(line) >= 4 else ""
-                    if not log_event(source_ip, "CMD", command=command):
+                elif request == "CMD" and len(parts) >= 2 and line[4:].strip():
+                    command = line[4:].strip()
+                    command_count += 1
+                    if not log_event(
+                        session_id, source_ip, "CMD", command=command
+                    ):
+                        disconnect_reason = "database_failure"
+                        break
+
+                elif line.upper() != "LOGOUT":
+                    if not log_event(
+                        session_id,
+                        source_ip,
+                        "INVALID_REQUEST",
+                        command=line,
+                    ):
+                        disconnect_reason = "database_failure"
                         break
 
                 response, should_close = response_for(line, logged_in)
@@ -376,19 +545,63 @@ def handle_client(client_socket, client_address):
                 client_socket.sendall((json.dumps(response) + "\n").encode("utf-8"))
 
                 if should_close:
+                    disconnect_reason = "logout"
                     break
-            else:
+
+            if shutdown_event.is_set() and disconnect_reason == "client_closed":
+                disconnect_reason = "server_shutdown"
+            elif (
+                request_count >= MAX_REQUESTS_PER_SESSION
+                and disconnect_reason == "client_closed"
+            ):
+                disconnect_reason = "request_limit"
                 print(f"Request limit reached: {client_address}")
     except socket.timeout:
-        print(f"Client idle timeout: {client_address}")
+        if shutdown_event.is_set():
+            disconnect_reason = "server_shutdown"
+        elif time.monotonic() - session_started >= MAX_SESSION_SECONDS:
+            disconnect_reason = "session_timeout"
+        else:
+            disconnect_reason = "idle_timeout"
+        if (
+            disconnect_reason != "server_shutdown"
+            and session_recorded
+            and not fatal_error_event.is_set()
+        ):
+            if not log_event(session_id, source_ip, "TIMEOUT"):
+                disconnect_reason = "database_failure"
+        print(f"Client session ended: {disconnect_reason}: {client_address}")
     except ValueError as error:
+        disconnect_reason = "invalid_request"
+        if session_recorded and not fatal_error_event.is_set():
+            if not log_event(
+                session_id,
+                source_ip,
+                "INVALID_REQUEST",
+                command=str(error),
+            ):
+                disconnect_reason = "database_failure"
         print(f"Client request rejected: {error}")
     except (ConnectionError, OSError, UnicodeError) as error:
+        disconnect_reason = (
+            "server_shutdown" if shutdown_event.is_set() else "connection_error"
+        )
         # Treat an unexpected client exit or malformed data as one session ending.
         print(f"Client session ended: {error}")
     finally:
-        if not fatal_error_event.is_set():
-            log_event(source_ip, "DISCONNECT")
+        if session_recorded and not fatal_error_event.is_set():
+            ended_at = datetime.now(timezone.utc).isoformat()
+            duration_seconds = max(0.0, time.monotonic() - session_started)
+            finish_session(
+                session_id,
+                source_ip,
+                ended_at,
+                duration_seconds,
+                request_count,
+                login_attempts,
+                command_count,
+                disconnect_reason,
+            )
         with active_clients_lock:
             active_clients.discard(client_socket)
             active_threads.discard(threading.current_thread())
@@ -555,7 +768,7 @@ def main():
 
                 client_thread = threading.Thread(
                     target=handle_client,
-                    args=(client_socket, client_address),
+                    args=(client_socket, client_address, str(uuid.uuid4())),
                     daemon=False,
                 )
                 # Register before start so shutdown cannot miss a new worker.
