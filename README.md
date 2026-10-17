@@ -1,9 +1,9 @@
 # SSH Honeypot
 
 This project is an educational SSH honeypot demonstration written in Python.
-It accepts connections through a small custom text protocol, returns safe fake
-Linux shell responses, and records session activity in a local SQLite database.
-The program never executes client commands on the host computer.
+It performs a real SSHv2 handshake through Paramiko, presents a safe fake Linux
+shell, and records session activity in a local SQLite database. The program
+never executes client commands on the host computer.
 
 ## Instructions for Build and Use
 
@@ -11,16 +11,23 @@ Steps to build or run the software:
 
 1. Install Python 3.11 or newer.
 2. Clone or download this project.
-3. No external packages need to be installed because the project uses only the
-   Python standard library.
+3. Create a virtual environment and install Paramiko:
+
+   ```bash
+   python3 -m venv .venv
+   source .venv/bin/activate
+   python3 -m pip install -r requirements.txt
+   ```
 
 Instructions for using the software:
 
-1. Open a terminal in the `SSHoneypot` directory and start the server:
-   `python3 server.py`
-2. Open a second terminal in the same directory and run the client:
-   `python3 client.py`
-3. Review the terminal output and inspect the generated `attacks.db` file if
+1. Open a terminal in the `SSHoneypot` directory, activate `.venv`, and start
+   the server: `python3 server.py`
+2. Open a second terminal and connect with a normal SSH client:
+   `ssh -p 2222 root@127.0.0.1`
+3. Enter any nonempty demonstration password. The login is intentionally
+   accepted into the simulated shell.
+4. Review the terminal output and inspect the generated `attacks.db` file if
    you want to review the recorded events. The database is intentionally
    ignored by Git and is recreated locally by the server.
 
@@ -30,16 +37,22 @@ Run the automated safety and integration tests with:
 python3 -m unittest -v test_server.py
 ```
 
-The server listens on `127.0.0.1:2222`. The client demonstrates the custom
-protocol messages `LOGIN`, `CMD`, and `LOGOUT`, followed by a second connection.
+The server listens on `127.0.0.1:2222`. On its first SSH-mode startup, it
+creates `ssh_host_rsa_key` with owner-only permissions. That private host key
+and the runtime database are ignored by Git and must not be shared.
+
+The original classroom client remains available in compatibility mode. Start
+`python3 server.py --protocol legacy`, then run `python3 client.py` in another
+terminal to demonstrate the custom `LOGIN`, `CMD`, and `LOGOUT` protocol.
 
 ## Development Environment
 
 To recreate the development environment, you need the following software and/or libraries with the specified versions:
 
 * Python 3.11 or newer
-* Python standard-library modules only, including `socket`, `threading`,
-  `sqlite3`, `json`, `argparse`, `signal`, and `datetime`
+* Paramiko 5.0.0, installed from `requirements.txt`
+* Python standard-library modules including `socket`, `threading`, `sqlite3`,
+  `json`, `argparse`, `signal`, and `datetime`
 * A terminal capable of running two local processes
 
 ## Useful Websites to Learn More
@@ -50,6 +63,7 @@ I found these websites useful in developing this software:
 * [Python Socket Programming HOWTO](https://docs.python.org/3/howto/sockets.html)
 * [Python threading documentation](https://docs.python.org/3/library/threading.html)
 * [Python sqlite3 documentation](https://docs.python.org/3/library/sqlite3.html)
+* [Paramiko server documentation](https://docs.paramiko.org/en/latest/api/server.html)
 
 ## Future Work
 
@@ -60,22 +74,26 @@ The following items I plan to fix, improve, and/or add to this project in the fu
 * [x] Add safer redaction and retention controls for captured event data.
 * [x] Harden the server for a short, supervised traffic-collection experiment.
 * [x] Deploy it to an isolated AWS environment after approval and EC2 testing.
+* [x] Add a real SSH handshake and interactive fake shell with Paramiko.
 
 ## Additional Project Information
 
-This project imitates the behavior of an SSH server but does not implement the
-real SSH protocol. Real SSH clients are recognized and disconnected. The
-included `client.py` communicates with the server through the custom `LOGIN`,
-`CMD`, and `LOGOUT` messages used for the project demonstration.
+This project implements the SSH transport, host-key negotiation, password
+authentication, shell channels, and command channels through Paramiko. Any
+nonempty username and password is deliberately accepted into the fake shell.
+Port forwarding, agent forwarding, X11, environment changes, and subsystems
+such as SFTP are not enabled. The included `client.py` is only for the optional
+legacy classroom protocol.
 
 All simulated command output is stored as fixed text in `server.py`. Client
 commands are never passed to the host operating system. The server also limits
 request size, idle time, total session time, requests per session, simultaneous
 clients, and database growth. Submitted passwords are redacted by default.
 
-The automated tests cover normal sessions, reconnects, concurrent clients,
-malformed and oversized requests, idle timeouts, password redaction, database
-failure handling, and graceful shutdown.
+The automated tests cover real SSH handshakes, password authentication,
+interactive and one-command SSH sessions, normal legacy sessions, reconnects,
+concurrent clients, malformed and oversized requests, idle timeouts, password
+redaction, database failure handling, and graceful shutdown.
 
 The hardened server has been deployed to an isolated Amazon EC2 environment
 for a supervised experiment. The live endpoint and collected database are not

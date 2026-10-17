@@ -15,6 +15,8 @@ from datetime import datetime
 from pathlib import Path
 from unittest import mock
 
+import paramiko
+
 import server as server_module
 
 
@@ -46,6 +48,8 @@ class ServerIntegrationTests(unittest.TestCase):
                 str(self.port),
                 "--database",
                 str(self.database),
+                "--protocol",
+                "legacy",
                 "--max-request-bytes",
                 "128",
                 "--idle-timeout",
@@ -347,6 +351,159 @@ class ServerIntegrationTests(unittest.TestCase):
         self.assertEqual(event_types, {"CONNECT", "DISCONNECT"})
 
 
+class SSHIntegrationTests(unittest.TestCase):
+    def setUp(self):
+        self.temporary_directory = tempfile.TemporaryDirectory()
+        directory = Path(self.temporary_directory.name)
+        self.database = directory / "attacks.db"
+        self.host_key = directory / "ssh_host_rsa_key"
+        self.port = unused_port()
+        self.process = subprocess.Popen(
+            [
+                sys.executable,
+                "-u",
+                str(SERVER),
+                "--host",
+                "127.0.0.1",
+                "--port",
+                str(self.port),
+                "--database",
+                str(self.database),
+                "--host-key",
+                str(self.host_key),
+                "--idle-timeout",
+                "1",
+                "--max-session-seconds",
+                "3",
+                "--shutdown-grace-seconds",
+                "2",
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
+        deadline = time.monotonic() + 8
+        while time.monotonic() < deadline:
+            if self.process.poll() is not None:
+                self.fail(f"SSH server failed:\n{self.process.communicate()[0]}")
+            try:
+                with socket.create_connection(
+                    ("127.0.0.1", self.port), timeout=0.1
+                ):
+                    break
+            except OSError:
+                time.sleep(0.03)
+        else:
+            self.fail("SSH server did not begin listening")
+
+    def tearDown(self):
+        if self.process.poll() is None:
+            self.process.send_signal(signal.SIGTERM)
+            try:
+                self.process.communicate(timeout=4)
+            except subprocess.TimeoutExpired:
+                self.process.kill()
+                self.process.communicate()
+        self.temporary_directory.cleanup()
+
+    def connect(self):
+        client = paramiko.SSHClient()
+        client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        client.connect(
+            "127.0.0.1",
+            port=self.port,
+            username="root",
+            password="definitely-not-real",
+            allow_agent=False,
+            look_for_keys=False,
+            timeout=2,
+            banner_timeout=2,
+            auth_timeout=2,
+        )
+        return client
+
+    def wait_for_session(self, reason):
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline:
+            with closing(sqlite3.connect(self.database)) as connection:
+                connection.row_factory = sqlite3.Row
+                row = connection.execute(
+                    """
+                    SELECT * FROM sessions
+                    WHERE disconnect_reason = ? AND ended_at IS NOT NULL
+                    ORDER BY started_at DESC LIMIT 1
+                    """,
+                    (reason,),
+                ).fetchone()
+            if row is not None:
+                return row
+            time.sleep(0.02)
+        self.fail(f"SSH session was not finalized as {reason}")
+
+    def test_real_ssh_handshake_authentication_and_exec_are_logged(self):
+        with self.connect() as client:
+            _, stdout, _ = client.exec_command("whoami", timeout=2)
+            self.assertEqual(stdout.read().decode().strip(), "root")
+
+        session = self.wait_for_session("command_complete")
+        self.assertEqual(session["login_attempts"], 1)
+        self.assertEqual(session["command_count"], 1)
+        self.assertEqual(session["request_count"], 2)
+
+        with closing(sqlite3.connect(self.database)) as connection:
+            events = connection.execute(
+                """
+                SELECT event_type, username, password, command
+                FROM events WHERE session_id = ? ORDER BY id
+                """,
+                (session["session_id"],),
+            ).fetchall()
+        self.assertEqual(
+            [event[0] for event in events],
+            ["CONNECT", "SSH_PROBE", "LOGIN_FAKE", "CMD", "DISCONNECT"],
+        )
+        self.assertIsNone(events[1][2])
+        self.assertEqual(events[3][3], "whoami")
+
+    def test_interactive_ssh_shell_returns_only_fake_output(self):
+        with self.connect() as client:
+            channel = client.invoke_shell(width=80, height=24)
+            channel.settimeout(2)
+            welcome = channel.recv(4096).decode()
+            self.assertIn(server_module.PROMPT, welcome)
+            channel.sendall("pwd\n")
+            response = ""
+            while server_module.PROMPT not in response:
+                response += channel.recv(4096).decode()
+            self.assertIn("/root", response)
+            channel.sendall("exit\n")
+            goodbye = ""
+            while "logout" not in goodbye:
+                goodbye += channel.recv(4096).decode()
+            channel.close()
+
+        session = self.wait_for_session("logout")
+        self.assertEqual(session["login_attempts"], 1)
+        self.assertEqual(session["command_count"], 2)
+
+    def test_oversized_ssh_exec_request_is_rejected(self):
+        with self.connect() as client:
+            with self.assertRaises(paramiko.SSHException):
+                client.exec_command("x" * 5000, timeout=2)
+
+        session = self.wait_for_session("invalid_request")
+        self.assertEqual(session["command_count"], 0)
+        with closing(sqlite3.connect(self.database)) as connection:
+            invalid_events = connection.execute(
+                """
+                SELECT COUNT(*) FROM events
+                WHERE session_id = ? AND event_type = 'INVALID_REQUEST'
+                """,
+                (session["session_id"],),
+            ).fetchone()[0]
+        self.assertEqual(invalid_events, 1)
+
+
 class StartupFailureTests(unittest.TestCase):
     def test_legacy_database_migration_preserves_events(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -395,6 +552,8 @@ class StartupFailureTests(unittest.TestCase):
                     str(port),
                     "--database",
                     str(database),
+                    "--protocol",
+                    "legacy",
                     "--retention-days",
                     "1",
                     "--idle-timeout",
@@ -456,6 +615,8 @@ class StartupFailureTests(unittest.TestCase):
                     str(unused_port()),
                     "--database",
                     str(database),
+                    "--protocol",
+                    "legacy",
                     "--max-database-bytes",
                     "1",
                 ],
@@ -476,6 +637,8 @@ class StartupFailureTests(unittest.TestCase):
                     str(SERVER),
                     "--database",
                     str(blocking_file / "attacks.db"),
+                    "--protocol",
+                    "legacy",
                 ],
                 capture_output=True,
                 text=True,

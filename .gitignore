@@ -5,3 +5,5 @@ __pycache__/
 *.pyc
 .venv/
 .DS_Store
+ssh_host_*_key
+ssh_host_*_key.pub

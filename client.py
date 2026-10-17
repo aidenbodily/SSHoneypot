@@ -1,4 +1,4 @@
-"""Test client for the SSH honeypot."""
+"""Legacy JSON-line demo client for `server.py --protocol legacy`."""
 
 import argparse
 import json

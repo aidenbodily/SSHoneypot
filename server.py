@@ -1,4 +1,4 @@
-"""Threaded socket server for the CSE310 networking exercise."""
+"""Threaded socket server for the CSE310 networking project."""
 
 import argparse
 import json
@@ -14,10 +14,13 @@ from contextlib import closing
 from datetime import datetime, timezone
 from pathlib import Path
 
-# Local demonstration defaults. AWS overrides these through command-line options.
+import paramiko
+
+# Local demonstration defaults. AWS deployment overrides these through command-line options.
 HOST = "127.0.0.1"
 PORT = 2222
 DATABASE = Path(__file__).resolve().parent / "attacks.db"
+HOST_KEY = Path(__file__).resolve().parent / "ssh_host_rsa_key"
 PROMPT = "root@server:~$"  # Display a believable prompt for the imaginary shell.
 
 # Bound every client-controlled resource so one connection cannot grow forever.
@@ -45,6 +48,45 @@ shutdown_reason = None
 active_clients = set()
 active_threads = set()
 active_clients_lock = threading.Lock()
+
+
+class SessionState:
+    """Thread-safe counters shared with Paramiko's protocol thread."""
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.request_count = 0
+        self.login_attempts = 0
+        self.command_count = 0
+        self.database_failed = False
+        self.request_limit_reached = False
+        self.invalid_request = False
+
+    def record_login(self):
+        with self.lock:
+            if self.request_count >= MAX_REQUESTS_PER_SESSION:
+                self.request_limit_reached = True
+                return False
+            self.request_count += 1
+            self.login_attempts += 1
+            return True
+
+    def record_command(self):
+        with self.lock:
+            if self.request_count >= MAX_REQUESTS_PER_SESSION:
+                self.request_limit_reached = True
+                return False
+            self.request_count += 1
+            self.command_count += 1
+            return True
+
+    def snapshot(self):
+        with self.lock:
+            return (
+                self.request_count,
+                self.login_attempts,
+                self.command_count,
+            )
 
 
 def clean_for_log(value, limit=256):
@@ -401,6 +443,191 @@ def fake_command_output(command):
     return f"bash: {command}: command not found"
 
 
+class HoneypotSSHServer(paramiko.ServerInterface):
+    """Approve a fake shell while refusing every SSH forwarding feature."""
+
+    def __init__(self, session_id, source_ip, state):
+        self.session_id = session_id
+        self.source_ip = source_ip
+        self.state = state
+        self.shell_requested = threading.Event()
+        self.exec_requested = threading.Event()
+        self.exec_command = None
+
+    def _log_login(self, event_type, username, password=None, command=None):
+        if not self.state.record_login():
+            return False
+        if not log_event(
+            self.session_id,
+            self.source_ip,
+            event_type,
+            username=username,
+            password=password,
+            command=command,
+        ):
+            self.state.database_failed = True
+            return False
+        return True
+
+    def get_allowed_auths(self, username):
+        return "password"
+
+    def check_auth_password(self, username, password):
+        credential_size = len(username.encode("utf-8")) + len(
+            password.encode("utf-8")
+        )
+        if credential_size > MAX_REQUEST_BYTES:
+            self.state.invalid_request = True
+            self._log_login(
+                "LOGIN_FAIL", username, command="credentials exceeded byte limit"
+            )
+            return paramiko.AUTH_FAILED
+        valid_login = bool(username and password)
+        login_logged = self._log_login(
+            "LOGIN_FAKE" if valid_login else "LOGIN_FAIL",
+            username,
+            password=password,
+        )
+        if valid_login and login_logged and not self.state.database_failed:
+            return paramiko.AUTH_SUCCESSFUL
+        return paramiko.AUTH_FAILED
+
+    def check_auth_none(self, username):
+        self._log_login("LOGIN_FAIL", username, command="auth method: none")
+        return paramiko.AUTH_FAILED
+
+    def check_auth_publickey(self, username, key):
+        fingerprint = key.fingerprint if key is not None else "unknown"
+        self._log_login(
+            "LOGIN_FAIL",
+            username,
+            command=f"auth method: publickey ({fingerprint})",
+        )
+        return paramiko.AUTH_FAILED
+
+    def check_channel_request(self, kind, chanid):
+        if kind == "session":
+            return paramiko.OPEN_SUCCEEDED
+        return paramiko.OPEN_FAILED_ADMINISTRATIVELY_PROHIBITED
+
+    def check_channel_pty_request(
+        self, channel, term, width, height, pixelwidth, pixelheight, modes
+    ):
+        return True
+
+    def check_channel_shell_request(self, channel):
+        self.shell_requested.set()
+        return True
+
+    def check_channel_exec_request(self, channel, command):
+        if len(command) > MAX_REQUEST_BYTES:
+            self.state.invalid_request = True
+            if not log_event(
+                self.session_id,
+                self.source_ip,
+                "INVALID_REQUEST",
+                command="SSH exec request exceeded byte limit",
+            ):
+                self.state.database_failed = True
+            self.exec_requested.set()
+            return False
+        self.exec_command = command.decode("utf-8", errors="replace")
+        self.exec_requested.set()
+        return True
+
+
+def load_or_create_host_key(path):
+    """Load a persistent SSH identity or create a protected RSA host key."""
+    try:
+        if path.exists():
+            path.chmod(0o600)
+            return paramiko.RSAKey.from_private_key_file(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        key = paramiko.RSAKey.generate(3072)
+        key.write_private_key_file(path)
+        path.chmod(0o600)
+        print(f"Generated SSH host key: {path}")
+        return key
+    except (OSError, paramiko.SSHException) as error:
+        request_shutdown(f"cannot load or create SSH host key: {error}")
+        return None
+
+
+def record_ssh_command(session_id, source_ip, state, command):
+    """Store and answer one SSH command without invoking the operating system."""
+    command = command.strip()
+    if not state.record_command():
+        return None
+    if not log_event(session_id, source_ip, "CMD", command=command):
+        state.database_failed = True
+        return None
+    return fake_command_output(command)
+
+
+def send_ssh_text(channel, text):
+    """Encode fake terminal output consistently for an SSH channel."""
+    channel.sendall(text.replace("\n", "\r\n").encode("utf-8"))
+
+
+def serve_ssh_shell(channel, session_id, source_ip, state, session_started):
+    """Run a small line-oriented fake shell over an encrypted SSH channel."""
+    send_ssh_text(channel, f"Welcome to Ubuntu 22.04.3 LTS\n{PROMPT} ")
+    pending = bytearray()
+
+    while not shutdown_event.is_set():
+        remaining_session = MAX_SESSION_SECONDS - (
+            time.monotonic() - session_started
+        )
+        if remaining_session <= 0:
+            return "session_timeout"
+        channel.settimeout(min(IDLE_TIMEOUT_SECONDS, remaining_session))
+        chunk = channel.recv(min(1024, MAX_REQUEST_BYTES + 1))
+        if not chunk:
+            return "client_closed"
+        channel.sendall(chunk)
+        pending.extend(chunk)
+        if len(pending) > MAX_REQUEST_BYTES:
+            raise ValueError("request exceeded the byte limit")
+
+        while b"\n" in pending or b"\r" in pending:
+            line_end = min(
+                index
+                for index in (pending.find(b"\n"), pending.find(b"\r"))
+                if index >= 0
+            )
+            raw_command = bytes(pending[:line_end])
+            remove_count = 2 if pending[line_end : line_end + 2] in (
+                b"\r\n",
+                b"\n\r",
+            ) else 1
+            del pending[: line_end + remove_count]
+            command = raw_command.decode("utf-8", errors="replace").strip()
+            if not command:
+                send_ssh_text(channel, f"\n{PROMPT} ")
+                continue
+            if command in ("exit", "logout"):
+                if not state.record_command():
+                    return "request_limit"
+                if not log_event(session_id, source_ip, "CMD", command=command):
+                    state.database_failed = True
+                    return "database_failure"
+                send_ssh_text(channel, "logout\n")
+                return "logout"
+
+            output = record_ssh_command(session_id, source_ip, state, command)
+            if output is None:
+                return (
+                    "request_limit"
+                    if state.request_limit_reached
+                    else "database_failure"
+                )
+            send_ssh_text(channel, f"\n{output}\n{PROMPT} ")
+            if state.snapshot()[0] >= MAX_REQUESTS_PER_SESSION:
+                return "request_limit"
+
+    return "server_shutdown"
+
+
 def response_for(line, logged_in=False):
     """Interpret one custom-protocol request without executing host commands."""
     parts = line.split(" ", 2)
@@ -439,7 +666,7 @@ def read_request(client_socket, pending_bytes):
     return raw_line.rstrip(b"\r").decode("utf-8", errors="replace"), bytearray(remaining)
 
 
-def handle_client(client_socket, client_address, session_id):
+def handle_legacy_client(client_socket, client_address, session_id):
     """Serve one isolated fake-shell session and record its activity."""
     print(f"Connected by {client_address}")
     source_ip = client_address[0]
@@ -610,6 +837,134 @@ def handle_client(client_socket, client_address, session_id):
         print(f"Disconnected: {client_address}")
 
 
+def handle_ssh_client(client_socket, client_address, session_id, host_key):
+    """Negotiate real SSH and connect it only to the simulated command table."""
+    print(f"SSH connection from {client_address}")
+    source_ip = client_address[0]
+    started_at = datetime.now(timezone.utc).isoformat()
+    session_started = time.monotonic()
+    disconnect_reason = "client_closed"
+    session_recorded = False
+    transport = None
+    state = SessionState()
+
+    try:
+        if not start_session(session_id, source_ip, started_at):
+            disconnect_reason = "database_failure"
+            return
+        session_recorded = True
+
+        client_socket.settimeout(IDLE_TIMEOUT_SECONDS)
+        transport = paramiko.Transport(client_socket)
+        transport.banner_timeout = IDLE_TIMEOUT_SECONDS
+        transport.auth_timeout = IDLE_TIMEOUT_SECONDS
+        transport.channel_timeout = IDLE_TIMEOUT_SECONDS
+        transport.add_server_key(host_key)
+        ssh_server = HoneypotSSHServer(session_id, source_ip, state)
+        transport.start_server(server=ssh_server)
+
+        remote_version = clean_for_log(transport.remote_version)
+        if not log_event(
+            session_id, source_ip, "SSH_PROBE", command=remote_version
+        ):
+            disconnect_reason = "database_failure"
+            return
+
+        channel = transport.accept(timeout=IDLE_TIMEOUT_SECONDS)
+        if channel is None:
+            if state.request_limit_reached:
+                disconnect_reason = "request_limit"
+            else:
+                disconnect_reason = "idle_timeout"
+                if not log_event(session_id, source_ip, "TIMEOUT"):
+                    disconnect_reason = "database_failure"
+            return
+
+        request_deadline = time.monotonic() + IDLE_TIMEOUT_SECONDS
+        while (
+            not ssh_server.shell_requested.is_set()
+            and not ssh_server.exec_requested.is_set()
+            and transport.is_active()
+            and not shutdown_event.is_set()
+            and time.monotonic() < request_deadline
+        ):
+            time.sleep(0.01)
+
+        if state.invalid_request:
+            disconnect_reason = "invalid_request"
+        elif ssh_server.exec_requested.is_set():
+            command = ssh_server.exec_command or ""
+            output = record_ssh_command(session_id, source_ip, state, command)
+            if output is None:
+                disconnect_reason = (
+                    "request_limit"
+                    if state.request_limit_reached
+                    else "database_failure"
+                )
+                return
+            send_ssh_text(channel, f"{output}\n")
+            channel.send_exit_status(0)
+            disconnect_reason = "command_complete"
+        elif ssh_server.shell_requested.is_set():
+            disconnect_reason = serve_ssh_shell(
+                channel, session_id, source_ip, state, session_started
+            )
+            if disconnect_reason in ("idle_timeout", "session_timeout"):
+                if not log_event(session_id, source_ip, "TIMEOUT"):
+                    disconnect_reason = "database_failure"
+        elif shutdown_event.is_set():
+            disconnect_reason = "server_shutdown"
+        else:
+            disconnect_reason = "idle_timeout"
+            if not log_event(session_id, source_ip, "TIMEOUT"):
+                disconnect_reason = "database_failure"
+    except socket.timeout:
+        disconnect_reason = (
+            "server_shutdown" if shutdown_event.is_set() else "idle_timeout"
+        )
+        if disconnect_reason != "server_shutdown" and session_recorded:
+            if not log_event(session_id, source_ip, "TIMEOUT"):
+                disconnect_reason = "database_failure"
+    except ValueError as error:
+        disconnect_reason = "invalid_request"
+        if session_recorded:
+            if not log_event(
+                session_id, source_ip, "INVALID_REQUEST", command=str(error)
+            ):
+                disconnect_reason = "database_failure"
+    except (paramiko.SSHException, EOFError, ConnectionError, OSError) as error:
+        disconnect_reason = (
+            "server_shutdown" if shutdown_event.is_set() else "connection_error"
+        )
+        print(f"SSH session ended: {error}")
+    finally:
+        if transport is not None:
+            transport.close()
+        try:
+            client_socket.close()
+        except OSError:
+            pass
+        if state.database_failed:
+            disconnect_reason = "database_failure"
+        if session_recorded and not fatal_error_event.is_set():
+            request_count, login_attempts, command_count = state.snapshot()
+            finish_session(
+                session_id,
+                source_ip,
+                datetime.now(timezone.utc).isoformat(),
+                max(0.0, time.monotonic() - session_started),
+                request_count,
+                login_attempts,
+                command_count,
+                disconnect_reason,
+            )
+        with active_clients_lock:
+            active_clients.discard(client_socket)
+            active_threads.discard(threading.current_thread())
+        client_slots.release()
+        print(f"SSH disconnected: {client_address}")
+
+
 def close_active_connections():
     """Wake blocked client threads by closing a snapshot of active sockets."""
     with active_clients_lock:
@@ -673,6 +1028,18 @@ def main():
     parser.add_argument("--host", default=HOST)
     parser.add_argument("--port", type=int, default=PORT)
     parser.add_argument("--database", type=Path, default=DATABASE)
+    parser.add_argument(
+        "--protocol",
+        choices=("ssh", "legacy"),
+        default="ssh",
+        help="serve real SSH (default) or the original JSON-line demo protocol",
+    )
+    parser.add_argument(
+        "--host-key",
+        type=Path,
+        default=HOST_KEY,
+        help="persistent RSA private key used to identify the SSH server",
+    )
     parser.add_argument("--max-request-bytes", type=int, default=MAX_REQUEST_BYTES)
     parser.add_argument("--idle-timeout", type=float, default=IDLE_TIMEOUT_SECONDS)
     parser.add_argument("--max-session-seconds", type=float, default=MAX_SESSION_SECONDS)
@@ -740,6 +1107,12 @@ def main():
     if not initialize_database():
         return 1
 
+    host_key = None
+    if args.protocol == "ssh":
+        host_key = load_or_create_host_key(args.host_key)
+        if host_key is None:
+            return 1
+
     signal.signal(signal.SIGTERM, handle_shutdown_signal)
     signal.signal(signal.SIGINT, handle_shutdown_signal)
 
@@ -751,7 +1124,7 @@ def main():
         server_socket.listen(MAX_CLIENTS)
         # A short accept timeout lets the loop notice shutdown requests promptly.
         server_socket.settimeout(1)
-        print(f"Server listening on {args.host}:{args.port}")
+        print(f"Server listening on {args.host}:{args.port} ({args.protocol})")
 
         try:
             while not shutdown_event.is_set():
@@ -766,9 +1139,24 @@ def main():
                     print(f"Connection limit reached: {client_address}")
                     continue
 
+                if args.protocol == "ssh":
+                    target = handle_ssh_client
+                    thread_args = (
+                        client_socket,
+                        client_address,
+                        str(uuid.uuid4()),
+                        host_key,
+                    )
+                else:
+                    target = handle_legacy_client
+                    thread_args = (
+                        client_socket,
+                        client_address,
+                        str(uuid.uuid4()),
+                    )
                 client_thread = threading.Thread(
-                    target=handle_client,
-                    args=(client_socket, client_address, str(uuid.uuid4())),
+                    target=target,
+                    args=thread_args,
                     daemon=False,
                 )
                 # Register before start so shutdown cannot miss a new worker.
